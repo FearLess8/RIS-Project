@@ -1,5 +1,10 @@
 <launch>
   <include file="$(find cu_ur5e_bringup)/launch/hardware.launch" />
-  <param name="robot_description" textfile="$(find ur5e_scene)/urdf/ur5e_table_vertical.urdf" />
-  <!-- <node name="ball_tracker" pkg="ur5e_scene" type="ball_tracker.py" output="screen" /> -->
+  <param name="robot_description" textfile="$(find ur5e_scene)/urdf/ur5e_table_vertical.urdf" />  
+
+
+  <node name="ball_tracker"
+        pkg="ur5e_scene"
+        type="ball_tracker.py"
+        output="screen" />
 </launch>
