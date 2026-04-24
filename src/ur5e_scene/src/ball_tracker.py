@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+import json
 import rospy
 import cv2
 import numpy as np
@@ -9,69 +11,55 @@ from visualization_msgs.msg import Marker
 from cv_bridge import CvBridge
 
 
-class BallTrackerTopViewNode:
+class TapedSquareBallTracker:
     def __init__(self):
-        rospy.init_node("ball_tracker_topview_node")
+        rospy.init_node("taped_square_ball_tracker")
 
         self.bridge = CvBridge()
 
         # -----------------------------
-        # ROS params
+        # Params
         # -----------------------------
-        self.image_topic   = rospy.get_param("~image_topic", "/cam/color/image_raw")
-        self.world_frame   = rospy.get_param("~world_frame", "map")
-
-        # Real table dimensions in meters
-        self.table_length  = rospy.get_param("~table_length", 1.60)
-        self.table_width   = rospy.get_param("~table_width", 0.80)
-
-        # Which detected table corner should be the origin
-        # one of: top_left, top_right, bottom_right, bottom_left
+        self.image_topic = rospy.get_param("~image_topic", "/cam/color/image_raw")
+        self.square_size = rospy.get_param("~square_size", 0.80)   # meters
         self.origin_corner = rospy.get_param("~origin_corner", "top_left")
-
-        # Ball size in RViz
+        self.world_frame = rospy.get_param("~world_frame", "table")
         self.ball_diameter = rospy.get_param("~ball_diameter", 0.04)
+        self.x_offset = rospy.get_param("~x_offset", 0.0)
+        self.y_offset = rospy.get_param("~y_offset", 0.0)
+        self.topview_ppm = rospy.get_param("~topview_ppm", 500)
 
-        # Constant correction offsets in meters
-        self.x_offset      = rospy.get_param("~x_offset", 0.0)
-        self.y_offset      = rospy.get_param("~y_offset", 0.0)
-
-        # Debug top-view resolution
-        self.topview_ppm   = rospy.get_param("~topview_ppm", 500)
+        default_calib = os.path.expanduser("~/.ros/taped_square_calibration.json")
+        self.calibration_file = rospy.get_param("~calibration_file", default_calib)
 
         # -----------------------------
-        # Ball color thresholds (LAB)
+        # Green ball detection (HSV)
         # -----------------------------
-        self.lower = np.array([85, 82, 132], dtype=np.uint8)
-        self.upper = np.array([130, 100, 150], dtype=np.uint8)
+        self.green_lower = np.array([35, 60, 40], dtype=np.uint8)
+        self.green_upper = np.array([95, 255, 255], dtype=np.uint8)
 
-        # Ball detection filters
-        self.min_area = 150
-        self.max_area = 20000
-        self.min_circularity = 0.60
+        self.min_ball_area = 100
+        self.max_ball_area = 30000
+        self.min_circularity = 0.55
 
         # -----------------------------
         # Runtime state
         # -----------------------------
         self.latest_frame = None
-        self.mask_view = None
+        self.ball_mask_view = None
         self.topview = None
-        self.detect_debug = None
 
-        self.img_pts = None       # 4 table corners in image, in mapping order
-        self.world_pts = None     # matching real-world rectangle points
-        self.H = None             # image -> world homography
-        self.H_top = None         # image -> top-view homography
+        self.clicked_points = []       # raw clicked points
+        self.square_pts_tl = None      # [tl, tr, br, bl]
+        self.square_pts_img = None     # [origin, +x, opposite, +y]
+        self.H = None
+        self.H_top = None
         self.calibrated = False
-        self.auto_detect_attempted = False
-        self.last_detect_status = "Waiting for image..."
+        self.last_status = "Waiting for image..."
 
         # -----------------------------
         # ROS I/O
         # -----------------------------
-        self.position_pub = rospy.Publisher("/ball_position", PointStamped, queue_size=1)
-        self.marker_pub = rospy.Publisher("/ball_marker", Marker, queue_size=1)
-
         self.image_sub = rospy.Subscriber(
             self.image_topic,
             Image,
@@ -79,21 +67,26 @@ class BallTrackerTopViewNode:
             queue_size=1
         )
 
+        self.position_pub = rospy.Publisher("/ball_position", PointStamped, queue_size=1)
+        self.marker_pub = rospy.Publisher("/ball_marker", Marker, queue_size=1)
+
         # -----------------------------
-        # OpenCV windows
+        # OpenCV
         # -----------------------------
         cv2.namedWindow("Ball Tracker", cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback("Ball Tracker", self.mouse_callback)
 
-        rospy.loginfo("BallTrackerTopViewNode started")
-        rospy.loginfo("Table size: %.2f m x %.2f m", self.table_length, self.table_width)
-        rospy.loginfo("Origin corner: %s", self.origin_corner)
-        rospy.loginfo("Offsets: x=%.3f m, y=%.3f m", self.x_offset, self.y_offset)
+        # Try loading saved calibration
+        self.load_calibration()
+
+        rospy.loginfo("TapedSquareBallTracker started")
+        rospy.loginfo("Calibration file: %s", self.calibration_file)
 
     def image_callback(self, msg):
         self.latest_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
 
     # ---------------------------------------------------
-    # Corner ordering / origin assignment
+    # Geometry helpers
     # ---------------------------------------------------
     def order_corners_tl_tr_br_bl(self, pts):
         pts = np.array(pts, dtype=np.float32)
@@ -101,15 +94,14 @@ class BallTrackerTopViewNode:
         s = pts.sum(axis=1)
         d = np.diff(pts, axis=1).reshape(-1)
 
-        top_left = pts[np.argmin(s)]
-        bottom_right = pts[np.argmax(s)]
-        top_right = pts[np.argmin(d)]
-        bottom_left = pts[np.argmax(d)]
+        tl = pts[np.argmin(s)]
+        br = pts[np.argmax(s)]
+        tr = pts[np.argmin(d)]
+        bl = pts[np.argmax(d)]
 
-        return np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
+        return np.array([tl, tr, br, bl], dtype=np.float32)
 
-    def rotate_corners_for_origin(self, ordered_pts):
-        # ordered_pts assumed in [top_left, top_right, bottom_right, bottom_left]
+    def rotate_for_origin(self, ordered_pts):
         tl, tr, br, bl = ordered_pts
 
         if self.origin_corner == "top_left":
@@ -121,181 +113,194 @@ class BallTrackerTopViewNode:
         elif self.origin_corner == "bottom_left":
             return np.array([bl, tl, tr, br], dtype=np.float32)
         else:
-            rospy.logwarn("Unknown origin_corner '%s', falling back to top_left", self.origin_corner)
+            rospy.logwarn("Unknown origin_corner '%s', using top_left", self.origin_corner)
             return np.array([tl, tr, br, bl], dtype=np.float32)
 
     # ---------------------------------------------------
-    # Automatic table detection
+    # Manual calibration
     # ---------------------------------------------------
-    def detect_table_corners(self, frame):
-        h0, w0 = frame.shape[:2]
+    def mouse_callback(self, event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
 
-        # downscale for faster / more stable contour search
-        target_w = min(1280, w0)
-        scale = float(target_w) / float(w0)
+        if self.calibrated:
+            return
 
-        if scale < 1.0:
-            small = cv2.resize(frame, (int(w0 * scale), int(h0 * scale)))
-        else:
-            small = frame.copy()
-            scale = 1.0
+        if len(self.clicked_points) < 4:
+            self.clicked_points.append([x, y])
+            rospy.loginfo("Clicked point %d: (%d, %d)", len(self.clicked_points), x, y)
 
-        h, w = small.shape[:2]
-        img_area = float(h * w)
+            if len(self.clicked_points) == 4:
+                self.finish_calibration_from_clicks()
 
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    def finish_calibration_from_clicks(self):
+        raw_pts = np.array(self.clicked_points, dtype=np.float32)
+        self.square_pts_tl = self.order_corners_tl_tr_br_bl(raw_pts)
+        self.square_pts_img = self.rotate_for_origin(self.square_pts_tl)
+        self.compute_homographies()
+        self.calibrated = True
+        self.last_status = "Calibration complete and saved"
+        self.save_calibration()
 
-        edges = cv2.Canny(blur, 40, 120)
+    def compute_homographies(self):
+        S = float(self.square_size)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
-        edges = cv2.dilate(edges, kernel, iterations=1)
+        square_pts_world = np.array([
+            [0.0, 0.0],
+            [S,   0.0],
+            [S,   S  ],
+            [0.0, S  ]
+        ], dtype=np.float32)
 
-        self.detect_debug = edges.copy()
+        self.H = cv2.getPerspectiveTransform(self.square_pts_img, square_pts_world)
 
-        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        ppm = int(self.topview_ppm)
+        top_size = max(1, int(S * ppm))
 
-        best_quad = None
-        best_score = -1e9
+        top_pts = np.array([
+            [0,          0],
+            [top_size-1, 0],
+            [top_size-1, top_size-1],
+            [0,          top_size-1]
+        ], dtype=np.float32)
 
-        expected_ratio = self.table_length / max(self.table_width, 1e-6)
+        self.H_top = cv2.getPerspectiveTransform(self.square_pts_img, top_pts)
+
+    def save_calibration(self):
+        if self.square_pts_tl is None:
+            return
+
+        data = {
+            "square_size": self.square_size,
+            "origin_corner": self.origin_corner,
+            "points_tl_tr_br_bl": self.square_pts_tl.tolist()
+        }
+
+        os.makedirs(os.path.dirname(self.calibration_file), exist_ok=True)
+        with open(self.calibration_file, "w") as f:
+            json.dump(data, f, indent=2)
+
+        rospy.loginfo("Calibration saved to %s", self.calibration_file)
+
+    def load_calibration(self):
+        if not os.path.exists(self.calibration_file):
+            self.last_status = "No saved calibration. Click 4 corners."
+            return False
+
+        try:
+            with open(self.calibration_file, "r") as f:
+                data = json.load(f)
+
+            pts = np.array(data["points_tl_tr_br_bl"], dtype=np.float32)
+            self.square_pts_tl = self.order_corners_tl_tr_br_bl(pts)
+            self.square_pts_img = self.rotate_for_origin(self.square_pts_tl)
+            self.compute_homographies()
+            self.calibrated = True
+            self.clicked_points = []
+            self.last_status = "Loaded saved calibration"
+            rospy.loginfo("Loaded calibration from %s", self.calibration_file)
+            return True
+
+        except Exception as e:
+            rospy.logwarn("Failed to load calibration: %s", e)
+            self.last_status = "Failed to load calibration. Click 4 corners."
+            return False
+
+    def reset_calibration(self):
+        self.clicked_points = []
+        self.square_pts_tl = None
+        self.square_pts_img = None
+        self.H = None
+        self.H_top = None
+        self.calibrated = False
+        self.topview = None
+        self.last_status = "Calibration reset. Click 4 corners."
+
+    def clear_saved_calibration(self):
+        if os.path.exists(self.calibration_file):
+            os.remove(self.calibration_file)
+            rospy.loginfo("Deleted calibration file: %s", self.calibration_file)
+        self.reset_calibration()
+        self.last_status = "Saved calibration deleted. Click 4 corners."
+
+    # ---------------------------------------------------
+    # Ball detection
+    # ---------------------------------------------------
+    def build_square_fill_mask(self, shape_hw):
+        h, w = shape_hw
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+        if self.square_pts_img is not None:
+            polygon = self.square_pts_img.astype(np.int32)
+            cv2.fillConvexPoly(mask, polygon, 255)
+
+        return mask
+
+    def detect_ball(self, frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        ball_mask = cv2.inRange(hsv, self.green_lower, self.green_upper)
+
+        if self.calibrated and self.square_pts_img is not None:
+            square_fill = self.build_square_fill_mask(ball_mask.shape)
+            ball_mask = cv2.bitwise_and(ball_mask, square_fill)
+
+        kernel = np.ones((5, 5), np.uint8)
+        ball_mask = cv2.morphologyEx(ball_mask, cv2.MORPH_OPEN, kernel)
+        ball_mask = cv2.morphologyEx(ball_mask, cv2.MORPH_CLOSE, kernel)
+        ball_mask = cv2.GaussianBlur(ball_mask, (5, 5), 0)
+
+        self.ball_mask_view = ball_mask.copy()
+
+        contours, _ = cv2.findContours(ball_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best = None
+        best_area = -1.0
 
         for cnt in contours:
-            cnt_area = cv2.contourArea(cnt)
-            if cnt_area < 0.12 * img_area:
+            area = cv2.contourArea(cnt)
+            if area < self.min_ball_area or area > self.max_ball_area:
                 continue
 
             peri = cv2.arcLength(cnt, True)
             if peri <= 0:
                 continue
 
-            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                quad = approx.reshape(-1, 2).astype(np.float32)
-            else:
-                rect = cv2.minAreaRect(cnt)
-                quad = cv2.boxPoints(rect).astype(np.float32)
-
-            quad = self.order_corners_tl_tr_br_bl(quad)
-
-            quad_area = cv2.contourArea(quad)
-            if quad_area < 0.12 * img_area:
-                continue
-            if quad_area > 0.97 * img_area:
+            circularity = 4.0 * np.pi * area / (peri * peri)
+            if circularity < self.min_circularity:
                 continue
 
-            # side lengths
-            w1 = np.linalg.norm(quad[1] - quad[0])
-            w2 = np.linalg.norm(quad[2] - quad[3])
-            h1 = np.linalg.norm(quad[3] - quad[0])
-            h2 = np.linalg.norm(quad[2] - quad[1])
+            (x, y), r = cv2.minEnclosingCircle(cnt)
+            u = int(x)
+            v = int(y)
+            r = int(r)
 
-            avg_w = 0.5 * (w1 + w2)
-            avg_h = 0.5 * (h1 + h2)
+            if self.calibrated and self.square_pts_img is not None:
+                inside = cv2.pointPolygonTest(
+                    self.square_pts_img.astype(np.float32),
+                    (float(u), float(v)),
+                    False
+                )
+                if inside < 0:
+                    continue
 
-            if avg_w < 30 or avg_h < 30:
-                continue
+            if area > best_area:
+                best_area = area
+                best = (u, v, r)
 
-            aspect = avg_w / max(avg_h, 1e-6)
-
-            # soft penalties
-            aspect_penalty = abs(np.log(max(aspect, 1e-6) / expected_ratio))
-
-            margin = 10
-            touches_border = (
-                (quad[:, 0] < margin) |
-                (quad[:, 0] > (w - 1 - margin)) |
-                (quad[:, 1] < margin) |
-                (quad[:, 1] > (h - 1 - margin))
-            )
-            touch_fraction = np.mean(touches_border.astype(np.float32))
-
-            # score: prefer large quads, prefer not touching image border,
-            # weakly prefer expected aspect ratio
-            score = (
-                2.0 * (quad_area / img_area)
-                - 0.35 * touch_fraction
-                - 0.08 * aspect_penalty
-            )
-
-            if score > best_score:
-                best_score = score
-                best_quad = quad.copy()
-
-        if best_quad is None:
-            return None
-
-        if scale < 1.0:
-            best_quad[:, 0] /= scale
-            best_quad[:, 1] /= scale
-
-        return best_quad
-
-    def auto_calibrate(self, frame):
-        detected = self.detect_table_corners(frame)
-
-        if detected is None:
-            self.calibrated = False
-            self.last_detect_status = "Auto table detection failed"
-            return False
-
-        ordered = self.order_corners_tl_tr_br_bl(detected)
-        self.img_pts = self.rotate_corners_for_origin(ordered)
-
-        L = float(self.table_length)
-        W = float(self.table_width)
-
-        self.world_pts = np.array([
-            [0.0, 0.0],
-            [L,   0.0],
-            [L,   W  ],
-            [0.0, W  ]
-        ], dtype=np.float32)
-
-        self.H = cv2.getPerspectiveTransform(self.img_pts, self.world_pts)
-
-        ppm = int(self.topview_ppm)
-        top_w = max(1, int(L * ppm))
-        top_h = max(1, int(W * ppm))
-
-        topview_pts = np.array([
-            [0,       0],
-            [top_w-1, 0],
-            [top_w-1, top_h-1],
-            [0,       top_h-1]
-        ], dtype=np.float32)
-
-        self.H_top = cv2.getPerspectiveTransform(self.img_pts, topview_pts)
-
-        self.calibrated = True
-        self.last_detect_status = "Auto table detection successful"
-        rospy.loginfo(self.last_detect_status)
-        return True
-
-    def reset_calibration(self):
-        self.img_pts = None
-        self.world_pts = None
-        self.H = None
-        self.H_top = None
-        self.calibrated = False
-        self.topview = None
-        self.last_detect_status = "Calibration reset"
-        self.delete_ball_marker()
+        return best
 
     # ---------------------------------------------------
-    # Mapping / publishing
+    # Coordinate conversion / publishing
     # ---------------------------------------------------
-    def image_to_world(self, u, v):
+    def image_to_square(self, u, v):
         pt = np.array([[[u, v]]], dtype=np.float32)
         mapped = cv2.perspectiveTransform(pt, self.H)
 
         x = float(mapped[0][0][0]) + self.x_offset
         y = float(mapped[0][0][1]) + self.y_offset
 
-        x = max(0.0, min(self.table_length, x))
-        y = max(0.0, min(self.table_width, y))
+        x = max(0.0, min(self.square_size, x))
+        y = max(0.0, min(self.square_size, y))
 
         return x, y
 
@@ -320,7 +325,7 @@ class BallTrackerTopViewNode:
 
         marker.pose.position.x = x
         marker.pose.position.y = y
-        marker.pose.position.z = 0.0
+        marker.pose.position.z = self.ball_diameter / 2.0
 
         marker.pose.orientation.x = 0.0
         marker.pose.orientation.y = 0.0
@@ -349,86 +354,17 @@ class BallTrackerTopViewNode:
         self.marker_pub.publish(marker)
 
     # ---------------------------------------------------
-    # Ball detection
+    # Debug displays
     # ---------------------------------------------------
-    def build_table_mask(self, shape_hw):
-        h, w = shape_hw
-        table_mask = np.zeros((h, w), dtype=np.uint8)
-
-        if self.img_pts is not None:
-            polygon = self.img_pts.astype(np.int32)
-            cv2.fillConvexPoly(table_mask, polygon, 255)
-
-        return table_mask
-
-    def detect_ball(self, frame):
-        blurred = cv2.GaussianBlur(frame, (7, 7), 0)
-        lab = cv2.cvtColor(blurred, cv2.COLOR_BGR2LAB)
-
-        mask = cv2.inRange(lab, self.lower, self.upper)
-
-        if self.calibrated and self.img_pts is not None:
-            table_mask = self.build_table_mask(mask.shape)
-            mask = cv2.bitwise_and(mask, table_mask)
-
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        mask = cv2.GaussianBlur(mask, (5, 5), 0)
-
-        self.mask_view = mask.copy()
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        best = None
-        best_area = -1.0
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < self.min_area or area > self.max_area:
-                continue
-
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter <= 0:
-                continue
-
-            circularity = 4.0 * np.pi * area / (perimeter * perimeter)
-            if circularity < self.min_circularity:
-                continue
-
-            (x2d, y2d), radius = cv2.minEnclosingCircle(cnt)
-            u = int(x2d)
-            v = int(y2d)
-            radius = int(radius)
-
-            if self.calibrated and self.img_pts is not None:
-                inside = cv2.pointPolygonTest(
-                    self.img_pts.astype(np.float32),
-                    (float(u), float(v)),
-                    False
-                )
-                if inside < 0:
-                    continue
-
-            if area > best_area:
-                best_area = area
-                best = (u, v, radius)
-
-        return best
-
-    # ---------------------------------------------------
-    # Debug views
-    # ---------------------------------------------------
-    def make_topview_debug(self, frame, detection):
+    def make_topview(self, frame, detection):
         if not self.calibrated or self.H_top is None:
             self.topview = None
             return
 
         ppm = int(self.topview_ppm)
-        out_w = max(1, int(self.table_length * ppm))
-        out_h = max(1, int(self.table_width * ppm))
+        out_size = max(1, int(self.square_size * ppm))
 
-        warped = cv2.warpPerspective(frame, self.H_top, (out_w, out_h))
+        warped = cv2.warpPerspective(frame, self.H_top, (out_size, out_size))
 
         cv2.arrowedLine(warped, (20, 20), (120, 20), (0, 0, 255), 3, tipLength=0.15)
         cv2.putText(warped, "+x", (130, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -449,53 +385,60 @@ class BallTrackerTopViewNode:
 
         self.topview = warped
 
-    def draw_wait_ui(self, frame):
+    def draw_ui(self, frame, detection):
         display = frame.copy()
 
-        cv2.putText(display, "Auto-detecting table...", (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-        cv2.putText(display, self.last_detect_status, (20, 65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(display, "r = retry detection | q = quit", (20, 100),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        if self.square_pts_tl is not None:
+            poly = self.square_pts_tl.astype(np.int32)
+            cv2.polylines(display, [poly], True, (255, 0, 0), 2)
 
-        return display
-
-    def draw_tracking_ui(self, frame, detection):
-        display = frame.copy()
-
-        if self.img_pts is not None:
-            polygon = self.img_pts.astype(np.int32)
-            cv2.polylines(display, [polygon], True, (255, 0, 0), 2)
-
-            for i, pt in enumerate(self.img_pts):
+            for i, pt in enumerate(self.square_pts_tl):
                 p = (int(pt[0]), int(pt[1]))
                 cv2.circle(display, p, 5, (255, 0, 255), -1)
                 cv2.putText(display, str(i + 1), (p[0] + 8, p[1] - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
 
-        cv2.putText(display, "Tracking active | r = re-detect table | q = quit",
-                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+        for i, pt in enumerate(self.clicked_points):
+            p = (int(pt[0]), int(pt[1]))
+            cv2.circle(display, p, 6, (0, 165, 255), -1)
+            cv2.putText(display, str(i + 1), (p[0] + 8, p[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
-        if detection is not None:
-            u, v, radius = detection
-            x_map, y_map = self.image_to_world(u, v)
+        if not self.calibrated:
+            cv2.putText(display, "Click 4 square corners", (20, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(display, "Saved after 4 clicks", (20, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(display, "r=reset  c=clear saved  q=quit", (20, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        else:
+            cv2.putText(display, "Tracking active", (20, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(display, "r=recalibrate  c=clear saved  q=quit", (20, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-            cv2.circle(display, (u, v), radius, (0, 255, 0), 3)
+        cv2.putText(display, self.last_status, (20, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+
+        if detection is not None and self.calibrated:
+            u, v, r = detection
+            x, y = self.image_to_square(u, v)
+
+            cv2.circle(display, (u, v), r, (0, 255, 0), 3)
             cv2.circle(display, (u, v), 5, (0, 0, 255), -1)
 
             cv2.putText(
                 display,
-                f"u={u}, v={v} | x={x_map:.3f} m, y={y_map:.3f} m",
-                (max(10, u - 190), max(25, v - 20)),
+                f"x={100*x:.1f} cm, y={100*y:.1f} cm",
+                (max(10, u - 120), max(25, v - 20)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
+                0.65,
                 (0, 255, 0),
                 2
             )
 
-            self.publish_ball_position(x_map, y_map)
-            self.publish_ball_marker(x_map, y_map)
+            self.publish_ball_position(x, y)
+            self.publish_ball_marker(x, y)
         else:
             self.delete_ball_marker()
 
@@ -514,33 +457,27 @@ class BallTrackerTopViewNode:
                 continue
 
             frame = self.latest_frame.copy()
+            detection = self.detect_ball(frame) if self.calibrated else None
 
-            if not self.calibrated:
-                self.auto_calibrate(frame)
-                display = self.draw_wait_ui(frame)
-                self.topview = None
-            else:
-                detection = self.detect_ball(frame)
-                display = self.draw_tracking_ui(frame, detection)
-                self.make_topview_debug(frame, detection)
+            display = self.draw_ui(frame, detection)
+            self.make_topview(frame, detection)
 
             cv2.imshow("Ball Tracker", display)
 
-            if self.mask_view is not None:
-                cv2.imshow("Mask", self.mask_view)
+            if self.ball_mask_view is not None:
+                cv2.imshow("Ball Mask", self.ball_mask_view)
 
             if self.topview is not None:
                 cv2.imshow("Top View", self.topview)
-
-            if self.detect_debug is not None and not self.calibrated:
-                cv2.imshow("Table Detect Edges", self.detect_debug)
 
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord('r'):
                 self.reset_calibration()
+            elif key == ord('c'):
+                self.clear_saved_calibration()
             elif key == ord('q'):
-                rospy.signal_shutdown("User quit")
+                rospy.signal_shutdown("Quit")
 
             rate.sleep()
 
@@ -549,7 +486,7 @@ class BallTrackerTopViewNode:
 
 if __name__ == "__main__":
     try:
-        node = BallTrackerTopViewNode()
+        node = TapedSquareBallTracker()
         node.run()
     except rospy.ROSInterruptException:
         pass
