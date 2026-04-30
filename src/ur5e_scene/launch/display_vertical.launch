@@ -1,7 +1,11 @@
 <launch>
-  <include file="$(find cu_ur5e_bringup)/launch/hardware.launch" />
+  <include file="$(find cu_ur5e_bringup)/launch/hardware.launch">
+    <arg name="rviz" value="false" />
+  </include>
+
   <param name="robot_description" textfile="$(find ur5e_scene)/urdf/ur5e_table_vertical.urdf" />  
 
-
   <node name="ball_tracker" pkg="ur5e_scene" type="ball_tracker.py" output="screen" />
+
+  <node name="$(anon rviz)" pkg="rviz" type="rviz" args="-d $(dirname)/../config/ballgame.rviz" />
 </launch>

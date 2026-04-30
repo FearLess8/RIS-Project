@@ -13,6 +13,16 @@
 [36m--[0m catkin 0.8.10
 [36m--[0m BUILD_SHARED_LIBS is on
 [36m--[0m Using these message generators: gencpp;geneus;genlisp;gennodejs;genpy
-[36m--[0m Configuring done
-[36m--[0m Generating done
-[36m--[0m Build files have been written to: /home/project26-group4/ros/build/ur5e_scene
+[36m--[0m ur5e_scene: 1 messages, 0 services
+[31mCMake Error at /usr/share/catkin/cmake/catkin_package.cmake:198 (message):
+  catkin_package() the catkin package 'visualization_msgs' has been
+  find_package()-ed but is not listed as a build dependency in the
+  package.xml
+[36mCall Stack (most recent call first):[0m
+  /usr/share/catkin/cmake/catkin_package.cmake:102 (_catkin_package)
+  CMakeLists.txt:112 (catkin_package)
+
+[0m
+[36m--[0m Configuring incomplete, errors occurred!
+See also "/home/project26-group4/ros/build/ur5e_scene/CMakeFiles/CMakeOutput.log".
+make: *** [Makefile:1262: cmake_check_build_system] Error 1

@@ -1,0 +1,10 @@
+[31mCMake Error at /usr/share/catkin/cmake/catkin_package.cmake:198 (message):
+  catkin_package() the catkin package 'visualization_msgs' has been
+  find_package()-ed but is not listed as a build dependency in the
+  package.xml
+[36mCall Stack (most recent call first):[0m
+  /usr/share/catkin/cmake/catkin_package.cmake:102 (_catkin_package)
+  CMakeLists.txt:112 (catkin_package)
+
+[0m
+make: *** [Makefile:1262: cmake_check_build_system] Error 1

@@ -1,0 +1,9 @@
+[31mCMake Error at /usr/share/catkin/cmake/catkin_package.cmake:226 (message):
+  catkin_package() DEPENDS on the catkin package 'visualization_msgs' which
+  must therefore be listed as a run dependency in the package.xml
+[36mCall Stack (most recent call first):[0m
+  /usr/share/catkin/cmake/catkin_package.cmake:102 (_catkin_package)
+  CMakeLists.txt:112 (catkin_package)
+
+[0m
+make: *** [Makefile:1262: cmake_check_build_system] Error 1

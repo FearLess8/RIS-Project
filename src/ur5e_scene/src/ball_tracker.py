@@ -23,8 +23,8 @@ class TapedSquareBallTracker:
         self.image_topic = rospy.get_param("~image_topic", "/cam/color/image_raw")
         self.square_size = rospy.get_param("~square_size", 0.80)   # meters
         self.origin_corner = rospy.get_param("~origin_corner", "top_left")
-        self.world_frame = rospy.get_param("~world_frame", "table")
-        self.ball_diameter = rospy.get_param("~ball_diameter", 0.04)
+        self.world_frame = rospy.get_param("~world_frame", "table_top")
+        self.ball_diameter = rospy.get_param("~ball_diameter", 0.03)
         self.x_offset = rospy.get_param("~x_offset", 0.0)
         self.y_offset = rospy.get_param("~y_offset", 0.0)
         self.topview_ppm = rospy.get_param("~topview_ppm", 500)
@@ -240,9 +240,10 @@ class TapedSquareBallTracker:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         ball_mask = cv2.inRange(hsv, self.green_lower, self.green_upper)
 
-        if self.calibrated and self.square_pts_img is not None:
-            square_fill = self.build_square_fill_mask(ball_mask.shape)
-            ball_mask = cv2.bitwise_and(ball_mask, square_fill)
+        # commenting out the part that limits ball detection to within the calibrated area:
+        # if self.calibrated and self.square_pts_img is not None:
+        #     square_fill = self.build_square_fill_mask(ball_mask.shape)
+        #     ball_mask = cv2.bitwise_and(ball_mask, square_fill)
 
         kernel = np.ones((5, 5), np.uint8)
         ball_mask = cv2.morphologyEx(ball_mask, cv2.MORPH_OPEN, kernel)
@@ -274,14 +275,15 @@ class TapedSquareBallTracker:
             v = int(y)
             r = int(r)
 
-            if self.calibrated and self.square_pts_img is not None:
-                inside = cv2.pointPolygonTest(
-                    self.square_pts_img.astype(np.float32),
-                    (float(u), float(v)),
-                    False
-                )
-                if inside < 0:
-                    continue
+            # Also limiting ball detection range.
+            # if self.calibrated and self.square_pts_img is not None:
+            #     inside = cv2.pointPolygonTest(
+            #         self.square_pts_img.astype(np.float32),
+            #         (float(u), float(v)),
+            #         False
+            #     )
+            #     if inside < 0:
+            #         continue
 
             if area > best_area:
                 best_area = area
@@ -296,13 +298,25 @@ class TapedSquareBallTracker:
         pt = np.array([[[u, v]]], dtype=np.float32)
         mapped = cv2.perspectiveTransform(pt, self.H)
 
-        x = float(mapped[0][0][0]) + self.x_offset
-        y = float(mapped[0][0][1]) + self.y_offset
+        # coordinates in the calibration-square coordinate system
+        x_local = float(mapped[0][0][0]) + self.x_offset
+        y_local = float(mapped[0][0][1]) + self.y_offset
 
-        x = max(0.0, min(self.square_size, x))
-        y = max(0.0, min(self.square_size, y))
+        # DO NOT clamp to [0, square_size] here
+        # because that kills extrapolation outside the square
 
-        return x, y
+        # convert from calibration-square coords to table_top coords
+        x_table = 0.40 - y_local
+        y_table = 0.80 - x_local
+
+        # optional: clamp only in the table-width direction
+        # since you said x should stay within the 80 cm width
+        x_table = max(-0.40, min(0.40, x_table))
+
+        # optional: clamp y to the full 160 cm table length if you want
+        # y_table = max(-0.80, min(0.80, y_table))
+
+        return x_table, y_table
 
     def publish_ball_position(self, x, y):
         msg = PointStamped()
