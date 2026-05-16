@@ -6,6 +6,7 @@ Panels:
       Expanded:
         - /Status1
         - /Cam1
+        - /Twist Control Zone1
         - /PointStamped1
         - /MarkerArray2
       Splitter Ratio: 0.6639344096183777
@@ -72,6 +73,11 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
         arm_base_link_inertia:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        arm_ee_adapter:
           Alpha: 1
           Show Axes: false
           Show Trail: false
@@ -343,13 +349,13 @@ Visualization Manager:
       Value: false
       Velocity_Scaling_Factor: 0.2
     - Class: rviz/MarkerArray
-      Enabled: false
+      Enabled: true
       Marker Topic: /zoned_twist_filter/zone
       Name: Twist Control Zone
       Namespaces:
-        {}
+        zone: true
       Queue Size: 1
-      Value: false
+      Value: true
     - Alpha: 1
       Class: rviz/PointStamped
       Color: 51; 209; 122
@@ -366,7 +372,7 @@ Visualization Manager:
       Marker Topic: /ball_trajectory_markers
       Name: MarkerArray
       Namespaces:
-        ball_trajectory: true
+        {}
       Queue Size: 100
       Value: true
   Enabled: true
@@ -397,7 +403,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 1.0208559036254883
+      Distance: 3.170623779296875
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -413,9 +419,9 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.4247973561286926
+      Pitch: 0.41979771852493286
       Target Frame: <Fixed Frame>
-      Yaw: 5.6382293701171875
+      Yaw: 4.508230686187744
     Saved: ~
 Window Geometry:
   Cam:

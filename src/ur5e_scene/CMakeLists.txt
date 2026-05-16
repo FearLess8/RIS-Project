@@ -57,6 +57,7 @@ find_package(catkin REQUIRED COMPONENTS
 add_message_files(
   FILES
   BallTrajectory.msg
+  BallArrival.msg
 )
 
 ## Generate services in the 'srv' folder
@@ -78,6 +79,11 @@ generate_messages(
   DEPENDENCIES
   std_msgs
   geometry_msgs
+)
+
+catkin_install_python(PROGRAMS
+  src/table_mover.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
 ################################################

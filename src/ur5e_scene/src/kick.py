@@ -1,144 +1,113 @@
 #!/usr/bin/env python3
-
 import sys
 import rospy
 import moveit_commander
+from controller_manager_msgs.srv import SwitchController
+from geometry_msgs.msg import TwistStamped
+from sensor_msgs.msg import JointState
 
-from std_msgs.msg import String
+READY_JOINTS = {
+    "arm_elbow_joint":         -2.166,
+    "arm_shoulder_lift_joint": -2.140,
+    "arm_shoulder_pan_joint":  -3.145,
+    "arm_wrist_1_joint":       -0.403,
+    "arm_wrist_2_joint":        1.567,
+    "arm_wrist_3_joint":        0.0,
+}
+JOINT_TOL = 0.05
 
+# ── Tune these ────────────────────────────────────────────────────────────────
+BACK_SPEED     = 0.2   # m/s  +Y (windup)
+BACK_DURATION  = 0.3   # s
 
-class MoveArmOnCommand:
-    def __init__(self):
-        rospy.init_node("move_arm_on_command", anonymous=True)
+FORWARD_SPEED  = 0.5   # m/s  -Y (kick)
+FORWARD_DURATION = 0.3 # s
+# ─────────────────────────────────────────────────────────────────────────────
 
-        moveit_commander.roscpp_initialize(sys.argv)
-
-        # Change this if your MoveIt group has another name, e.g. "manipulator"
-        self.group_name = rospy.get_param("~move_group", "arm")
-
-        self.robot = moveit_commander.RobotCommander()
-        self.scene = moveit_commander.PlanningSceneInterface()
-        self.group = moveit_commander.MoveGroupCommander(self.group_name)
-
-        # -----------------------------
-        # MoveIt planning settings
-        # -----------------------------
-        self.group.set_planning_time(10.0)
-        self.group.set_num_planning_attempts(10)
-        self.group.allow_replanning(True)
-
-        # Optional but usually good
-        self.group.set_max_velocity_scaling_factor(0.25)
-        self.group.set_max_acceleration_scaling_factor(0.25)
-
-        # Joint target from your screenshot, in radians
-        self.target_joint_values = [
-            -0.196,   # arm_shoulder_pan_joint
-            -0.697,   # arm_shoulder_lift_joint
-             1.356,   # arm_elbow_joint
-             2.832,   # arm_wrist_1_joint
-            -1.674,   # arm_wrist_2_joint
-             2.675    # arm_wrist_3_joint
-        ]
-
-        # Optional: add a simple table/floor collision object
-        self.add_basic_collision_objects()
-
-        rospy.Subscriber("/arm_command", String, self.command_callback)
-
-        rospy.loginfo("Ready. Send '1' on /arm_command to move the robot.")
-
-    def add_basic_collision_objects(self):
-        """
-        MoveIt avoids collisions only with objects it knows about.
-        This adds a simple floor/table collision box.
-        Adjust position and size for your real setup.
-        """
-
-        rospy.sleep(1.0)
-
-        frame = self.robot.get_planning_frame()
-
-        from geometry_msgs.msg import PoseStamped
-
-        table_pose = PoseStamped()
-        table_pose.header.frame_id = frame
-
-        # Adjust these values for your table/workspace
-        table_pose.pose.position.x = 0.0
-        table_pose.pose.position.y = 0.0
-        table_pose.pose.position.z = -0.05
-
-        table_pose.pose.orientation.w = 1.0
-
-        # size = x, y, z in meters
-        self.scene.add_box(
-            name="table",
-            pose=table_pose,
-            size=(1.5, 1.5, 0.10)
-        )
-
-        rospy.loginfo("Added table collision object to planning scene.")
-
-    def command_callback(self, msg):
-        command = msg.data.strip()
-
-        if command == "1":
-            rospy.loginfo("Received command 1. Planning motion...")
-
-            success = self.plan_and_execute(self.target_joint_values)
-
-            if success:
-                rospy.loginfo("Motion completed successfully.")
-            else:
-                rospy.logwarn("Motion failed or no valid collision-free plan found.")
-
-    def plan_and_execute(self, joint_goal):
-        self.group.stop()
-        self.group.clear_pose_targets()
-        self.group.set_start_state_to_current_state()
-
-        current_joints = self.group.get_current_joint_values()
-
-        rospy.loginfo("Current joints:")
-        rospy.loginfo(current_joints)
-
-        rospy.loginfo("Target joints:")
-        rospy.loginfo(joint_goal)
-
-        self.group.set_joint_value_target(joint_goal)
-
-        plan_result = self.group.plan()
-
-        # MoveIt Python API differs slightly between versions
-        if isinstance(plan_result, tuple):
-            success = plan_result[0]
-            plan = plan_result[1]
-        else:
-            plan = plan_result
-            success = len(plan.joint_trajectory.points) > 0
-
-        if not success:
-            rospy.logwarn("Planning failed. Robot will not move.")
-            return False
-
-        rospy.loginfo("Plan found. Executing...")
-
-        execute_success = self.group.execute(plan, wait=True)
-
-        self.group.stop()
-        self.group.clear_pose_targets()
-
-        return execute_success
+RATE_HZ = 50
+DT = 1.0 / RATE_HZ
 
 
-if __name__ == "__main__":
+def switch_controller(start, stop):
+    rospy.wait_for_service("/controller_manager/switch_controller")
+    svc = rospy.ServiceProxy("/controller_manager/switch_controller", SwitchController)
+    svc(start_controllers=start, stop_controllers=stop, strictness=2)
+
+
+def is_at_ready():
     try:
-        node = MoveArmOnCommand()
-        rospy.spin()
+        js = rospy.wait_for_message("/joint_states", JointState, timeout=3.0)
+        for name, target in READY_JOINTS.items():
+            if name in js.name:
+                if abs(js.position[js.name.index(name)] - target) > JOINT_TOL:
+                    return False
+        return True
+    except Exception:
+        return False
 
-    except rospy.ROSInterruptException:
-        pass
 
-    finally:
-        moveit_commander.roscpp_shutdown()
+def go_to_ready(arm):
+    switch_controller(["scaled_pos_joint_traj_controller"], ["twist_controller"])
+    arm.set_joint_value_target(READY_JOINTS)
+    arm.set_max_velocity_scaling_factor(0.7)
+    arm.set_max_acceleration_scaling_factor(0.7)
+    success = arm.go(wait=True)
+    arm.stop()
+    if not success:
+        rospy.logerr("[KICK] Failed to reach ready position!")
+        sys.exit(1)
+    switch_controller(["twist_controller"], ["scaled_pos_joint_traj_controller"])
+
+
+def twist_y(pub, vy):
+    msg = TwistStamped()
+    msg.header.stamp = rospy.Time.now()
+    msg.header.frame_id = "table_top"
+    msg.twist.linear.y = vy
+    pub.publish(msg)
+
+
+# ── Init ──────────────────────────────────────────────────────────────────────
+rospy.init_node("kick")
+moveit_commander.roscpp_initialize(sys.argv)
+
+arm = moveit_commander.MoveGroupCommander("arm")
+pub = rospy.Publisher("twist_controller/zoned_command", TwistStamped, queue_size=1)
+rate = rospy.Rate(RATE_HZ)
+
+if not is_at_ready():
+    rospy.loginfo("[KICK] Moving to ready position...")
+    go_to_ready(arm)
+else:
+    rospy.loginfo("[KICK] Already at ready position.")
+
+rospy.sleep(0.5)
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+while not rospy.is_shutdown():
+    print("\n[KICK] Place the ball then press ENTER to kick (Ctrl+C to quit)...")
+    try:
+        input()
+    except (KeyboardInterrupt, EOFError):
+        break
+
+    # Back (+Y)
+    rospy.loginfo("[KICK] Back...")
+    elapsed = 0.0
+    while elapsed < BACK_DURATION and not rospy.is_shutdown():
+        twist_y(pub, BACK_SPEED)
+        rate.sleep()
+        elapsed += DT
+
+    # Forward (-Y)
+    rospy.loginfo("[KICK] Forward!")
+    elapsed = 0.0
+    while elapsed < FORWARD_DURATION and not rospy.is_shutdown():
+        twist_y(pub, -FORWARD_SPEED)
+        rate.sleep()
+        elapsed += DT
+
+    twist_y(pub, 0.0)
+    rospy.loginfo("[KICK] Done. Returning to ready...")
+    go_to_ready(arm)
+    rospy.loginfo("[KICK] Ready.")

@@ -308,27 +308,27 @@
     <origin rpy="0 0 1.5707963267948966" xyz="0 0 0.0"/>
   </joint>
 
-<!-- <link name="arm_ee_adapter">
-  <visual>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-    <geometry>
+  <link name="arm_ee_adapter">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
       <mesh filename="package://ur5e_scene/meshes/end_effector.stl" scale="0.001 0.001 0.001"/>
     </geometry>
-  </visual>
+    </visual>
 
-  <collision>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-    <geometry>
-      <mesh filename="package://ur5e_scene/meshes/end_effector.stl" scale="0.001 0.001 0.001"/>
-    </geometry>
-  </collision>
-</link> -->
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+       <mesh filename="package://ur5e_scene/meshes/end_effector.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+  </link> 
 
-  <!-- <joint name="arm_flange_to_adapter" type="fixed">
+   <joint name="arm_flange_to_adapter" type="fixed">
     <parent link="arm_tool0"/>
     <child link="arm_ee_adapter"/>
-    <origin rpy="1.5 0 0" xyz="0.02 0 0"/>
-  </joint> -->
+    <origin rpy="1.57 0 1.63" xyz="0 0 0.023"/>
+  </joint>
 
   <link name="arm_flange_safety">
     <visual>
@@ -338,7 +338,7 @@
     </visual>
     <collision>
       <geometry><sphere radius="0.0655"/></geometry>
-      <origin rpy="0 0 0" xyz="0 0 0.0"/>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
     </collision>
   </link>
   <joint name="arm_flange_safety_joint" type="fixed">

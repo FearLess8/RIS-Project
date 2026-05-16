@@ -1,0 +1,24 @@
+<launch>
+  <!-- Existing robot launch -->
+  <include file="$(find ur5e_scene)/launch/display_vertical.launch"></include>
+  
+  <!-- ball tracking on table frame -->
+  <node name="ball_tracker" pkg="ur5e_scene" type="ball_tracker.py" output="screen">
+    <param name="image_topic" value="/cam/color/image_raw"/>
+    <param name="world_frame" value="table_top"/>
+    <param name="square_size" value="0.8"/>
+  </node>
+  
+  <!-- trajectory prediction using ball position messages -->
+  <node name="trajectory_predictor" pkg="ur5e_scene" type="trajectory_predictor.py" output="screen">
+    <param name="input_topic" value="/ball_position"/>
+    <param name="prediction_dt" value="1.0"/>
+    <param name="history_len" value="10"/>
+    <param name="min_speed" value="0.05"/>
+    <param name="workspace_min_x" value="-0.40"/>
+    <param name="workspace_max_x" value="0.40"/>
+    <param name="workspace_y" value="0.60"/>
+    <param name="min_time_to_arrival" value="0.1"/>  <!-- Ignore balls arriving in <0.1s -->
+  </node>
+  
+</launch>

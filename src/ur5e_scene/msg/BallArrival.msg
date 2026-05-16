@@ -1,0 +1,4 @@
+Header header
+geometry_msgs/Point arrival_position
+float32 time_to_arrival
+bool valid

@@ -11,6 +11,36 @@ from visualization_msgs.msg import Marker
 from cv_bridge import CvBridge
 
 
+class DebugVisualizer:
+    """Handles optional debug visualization windows."""
+    
+    def __init__(self, enabled=False):
+        self.enabled = enabled
+    
+    def set_enabled(self, enabled):
+        self.enabled = enabled
+        if not enabled:
+            self.close_all()
+    
+    def show_ball_mask(self, mask):
+        """Display the ball detection mask."""
+        if self.enabled and mask is not None:
+            cv2.imshow("Ball Mask", mask)
+    
+    def show_topview(self, topview):
+        """Display the top-down calibration view."""
+        if self.enabled and topview is not None:
+            cv2.imshow("Top View", topview)
+    
+    def close_all(self):
+        """Close all debug windows."""
+        try:
+            cv2.destroyWindow("Ball Mask")
+            cv2.destroyWindow("Top View")
+        except:
+            pass
+
+
 class TapedSquareBallTracker:
     def __init__(self):
         rospy.init_node("taped_square_ball_tracker")
@@ -28,6 +58,7 @@ class TapedSquareBallTracker:
         self.x_offset = rospy.get_param("~x_offset", 0.0)
         self.y_offset = rospy.get_param("~y_offset", 0.0)
         self.topview_ppm = rospy.get_param("~topview_ppm", 500)
+        self.debug = rospy.get_param("~debug", False)
 
         default_calib = os.path.expanduser("~/.ros/taped_square_calibration.json")
         self.calibration_file = rospy.get_param("~calibration_file", default_calib)
@@ -35,12 +66,17 @@ class TapedSquareBallTracker:
         # -----------------------------
         # Green ball detection (HSV)
         # -----------------------------
-        self.green_lower = np.array([35, 60, 40], dtype=np.uint8)
-        self.green_upper = np.array([95, 255, 255], dtype=np.uint8)
+        self.green_lower = np.array([52, 60, 40], dtype=np.uint8)
+        self.green_upper = np.array([91, 255, 255], dtype=np.uint8)
 
-        self.min_ball_area = 100
+
+        self.min_ball_area = 300
         self.max_ball_area = 30000
         self.min_circularity = 0.55
+
+        # Tracking robustness parameters
+        self.position_alpha = 0.25  # Exponential smoothing factor (0-1, lower = more smoothing)
+        self.loss_timeout = 1  # Seconds to remember last position if tracking is lost
 
         # -----------------------------
         # Runtime state
@@ -57,6 +93,11 @@ class TapedSquareBallTracker:
         self.calibrated = False
         self.last_status = "Waiting for image..."
 
+        # Temporal tracking state
+        self.last_detection_time = None
+        self.last_valid_position = None
+        self.smoothed_position = None
+
         # -----------------------------
         # ROS I/O
         # -----------------------------
@@ -71,6 +112,11 @@ class TapedSquareBallTracker:
         self.marker_pub = rospy.Publisher("/ball_marker", Marker, queue_size=1)
 
         # -----------------------------
+        # Debug visualizer
+        # -----------------------------
+        self.debugger = DebugVisualizer(enabled=self.debug)
+
+        # -----------------------------
         # OpenCV
         # -----------------------------
         cv2.namedWindow("Ball Tracker", cv2.WINDOW_NORMAL)
@@ -81,6 +127,7 @@ class TapedSquareBallTracker:
 
         rospy.loginfo("TapedSquareBallTracker started")
         rospy.loginfo("Calibration file: %s", self.calibration_file)
+        rospy.loginfo("Debug mode: %s", "enabled" if self.debug else "disabled")
 
     def image_callback(self, msg):
         self.latest_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -426,9 +473,14 @@ class TapedSquareBallTracker:
             cv2.putText(display, "r=reset  c=clear saved  q=quit", (20, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         else:
-            cv2.putText(display, "Tracking active", (20, 30),
+            status = "Tracking active"
+            if detection is None and self.last_detection_time is not None:
+                time_since = (rospy.Time.now() - self.last_detection_time).to_sec()
+                if time_since < self.loss_timeout:
+                    status = f"Tracking (occluded {time_since:.2f}s)"
+            cv2.putText(display, status, (20, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            cv2.putText(display, "r=recalibrate  c=clear saved  q=quit", (20, 60),
+            cv2.putText(display, "r=recalibrate  c=clear  d=debug  q=quit", (20, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         cv2.putText(display, self.last_status, (20, 120),
@@ -438,12 +490,27 @@ class TapedSquareBallTracker:
             u, v, r = detection
             x, y = self.image_to_square(u, v)
 
+            # Apply exponential smoothing to reduce noise
+            current_pos = np.array([x, y], dtype=np.float32)
+            if self.smoothed_position is None:
+                self.smoothed_position = current_pos
+            else:
+                self.smoothed_position = (
+                    self.position_alpha * current_pos +
+                    (1 - self.position_alpha) * self.smoothed_position
+                )
+
+            # Remember this as valid detection
+            self.last_detection_time = rospy.Time.now()
+            self.last_valid_position = self.smoothed_position.copy()
+
+            # Draw raw detection on display
             cv2.circle(display, (u, v), r, (0, 255, 0), 3)
             cv2.circle(display, (u, v), 5, (0, 0, 255), -1)
 
             cv2.putText(
                 display,
-                f"x={100*x:.1f} cm, y={100*y:.1f} cm",
+                f"x={100*self.smoothed_position[0]:.1f} cm, y={100*self.smoothed_position[1]:.1f} cm",
                 (max(10, u - 120), max(25, v - 20)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -451,10 +518,23 @@ class TapedSquareBallTracker:
                 2
             )
 
-            self.publish_ball_position(x, y)
-            self.publish_ball_marker(x, y)
+            # Publish smoothed position
+            self.publish_ball_position(self.smoothed_position[0], self.smoothed_position[1])
+            self.publish_ball_marker(self.smoothed_position[0], self.smoothed_position[1])
         else:
-            self.delete_ball_marker()
+            # Detection failed - check if we can use the last known position
+            if self.calibrated and self.last_detection_time is not None:
+                time_since_detection = (rospy.Time.now() - self.last_detection_time).to_sec()
+
+                if time_since_detection < self.loss_timeout:
+                    # Still within timeout, use last known position
+                    self.publish_ball_position(self.last_valid_position[0], self.last_valid_position[1])
+                    self.publish_ball_marker(self.last_valid_position[0], self.last_valid_position[1])
+                else:
+                    # Timeout exceeded
+                    self.delete_ball_marker()
+            else:
+                self.delete_ball_marker()
 
         return display
 
@@ -478,11 +558,8 @@ class TapedSquareBallTracker:
 
             cv2.imshow("Ball Tracker", display)
 
-            if self.ball_mask_view is not None:
-                cv2.imshow("Ball Mask", self.ball_mask_view)
-
-            if self.topview is not None:
-                cv2.imshow("Top View", self.topview)
+            self.debugger.show_ball_mask(self.ball_mask_view)
+            self.debugger.show_topview(self.topview)
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -490,6 +567,11 @@ class TapedSquareBallTracker:
                 self.reset_calibration()
             elif key == ord('c'):
                 self.clear_saved_calibration()
+            elif key == ord('d'):
+                self.debug = not self.debug
+                self.debugger.set_enabled(self.debug)
+                status = "enabled" if self.debug else "disabled"
+                rospy.loginfo("Debug mode %s", status)
             elif key == ord('q'):
                 rospy.signal_shutdown("Quit")
 

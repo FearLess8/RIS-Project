@@ -6,8 +6,9 @@ import rospy
 import numpy as np
 
 from geometry_msgs.msg import Point, PointStamped, Vector3Stamped
+from std_msgs.msg import Header
 from visualization_msgs.msg import Marker, MarkerArray
-from ur5e_scene.msg import BallTrajectory   # change package name if needed
+from ur5e_scene.msg import BallTrajectory, BallArrival
 
 
 class TrajectoryPredictor:
@@ -23,6 +24,12 @@ class TrajectoryPredictor:
         self.marker_z = rospy.get_param("~marker_z", 0.02)
         self.arrow_scale = rospy.get_param("~arrow_scale", 1.0)
 
+        # Robot workspace boundaries
+        self.workspace_min_x = rospy.get_param("~workspace_min_x", -0.40)
+        self.workspace_max_x = rospy.get_param("~workspace_max_x", 0.40)
+        self.workspace_y = rospy.get_param("~workspace_y", 0.60)  # Front edge where prediction happens
+        self.min_time_to_arrival = rospy.get_param("~min_time_to_arrival", 0.1)  # Ignore very close impacts
+
         self.history = deque(maxlen=self.history_len)
         self.last_msg_time = None
         self.frame_id = "table_top"
@@ -37,10 +44,12 @@ class TrajectoryPredictor:
         self.vel_pub = rospy.Publisher("/ball_velocity", Vector3Stamped, queue_size=1)
         self.pred_pub = rospy.Publisher("/ball_prediction", PointStamped, queue_size=1)
         self.traj_pub = rospy.Publisher("/ball_trajectory", BallTrajectory, queue_size=1)
+        self.arrival_pub = rospy.Publisher("/ball_arrival", BallArrival, queue_size=1)
         self.marker_pub = rospy.Publisher("/ball_trajectory_markers", MarkerArray, queue_size=1)
 
         rospy.loginfo("BallTrajectoryEstimator started")
         rospy.loginfo("Listening on %s", self.input_topic)
+        rospy.loginfo("Workspace Y (front edge): %.2f m", self.workspace_y)
 
     def position_callback(self, msg):
         now = msg.header.stamp.to_sec() if msg.header.stamp != rospy.Time() else rospy.Time.now().to_sec()
@@ -51,10 +60,12 @@ class TrajectoryPredictor:
 
         if len(self.history) < self.min_samples:
             self.publish_basic_markers_only(msg.point.x, msg.point.y)
+            self.publish_arrival(None)  # Invalid arrival
             return
 
         result = self.estimate_velocity()
         if result is None:
+            self.publish_arrival(None)
             return
 
         x, y, vx, vy = result
@@ -71,7 +82,12 @@ class TrajectoryPredictor:
         self.publish_velocity(vx, vy)
         self.publish_prediction(pred_x, pred_y)
         self.publish_trajectory_msg(x, y, vx, vy, speed, pred_x, pred_y)
-        self.publish_markers(x, y, vx, vy, pred_x, pred_y)
+        
+        # Calculate and publish arrival at workspace boundary
+        arrival = self.calculate_arrival(x, y, vx, vy)
+        self.publish_arrival(arrival)
+        
+        self.publish_markers(x, y, vx, vy, pred_x, pred_y, arrival)
 
     def estimate_velocity(self):
         if len(self.history) < self.min_samples:
@@ -107,6 +123,37 @@ class TrajectoryPredictor:
 
         return x_now, y_now, vx, vy
 
+    def calculate_arrival(self, x, y, vx, vy):
+        """
+        Calculate where and when the ball will arrive at workspace_y (y=0.60).
+        Returns: {'x': x_arrival, 'time': time_to_arrival} or None if not heading towards workspace.
+        """
+        # Check if ball is moving towards the workspace y boundary
+        dy = self.workspace_y - y
+        
+        # If vy is too small, ball won't reach the line
+        if abs(vy) < 1e-6:
+            return None
+        
+        # Calculate time to reach workspace_y
+        time_to_arrival = dy / vy
+        
+        # Only consider if arriving in the future with reasonable time
+        if time_to_arrival < self.min_time_to_arrival:
+            return None
+        
+        # Calculate x position at arrival
+        x_arrival = x + vx * time_to_arrival
+        
+        # Check if x is within workspace bounds
+        if x_arrival < self.workspace_min_x or x_arrival > self.workspace_max_x:
+            return None
+        
+        return {
+            'x': x_arrival,
+            'time': time_to_arrival
+        }
+
     def publish_velocity(self, vx, vy):
         msg = Vector3Stamped()
         msg.header.stamp = rospy.Time.now()
@@ -124,6 +171,27 @@ class TrajectoryPredictor:
         msg.point.y = y
         msg.point.z = 0.0
         self.pred_pub.publish(msg)
+
+    def publish_arrival(self, arrival):
+        """Publish ball arrival prediction at workspace boundary."""
+        msg = BallArrival()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = self.frame_id
+        
+        if arrival is None:
+            msg.valid = False
+            msg.arrival_position.x = 0.0
+            msg.arrival_position.y = self.workspace_y
+            msg.arrival_position.z = 0.0
+            msg.time_to_arrival = 0.0
+        else:
+            msg.valid = True
+            msg.arrival_position.x = arrival['x']
+            msg.arrival_position.y = self.workspace_y
+            msg.arrival_position.z = 0.0
+            msg.time_to_arrival = arrival['time']
+        
+        self.arrival_pub.publish(msg)
 
     def publish_trajectory_msg(self, x, y, vx, vy, speed, pred_x, pred_y):
         msg = BallTrajectory()
@@ -183,7 +251,7 @@ class TrajectoryPredictor:
 
         self.marker_pub.publish(markers)
 
-    def publish_markers(self, x, y, vx, vy, pred_x, pred_y):
+    def publish_markers(self, x, y, vx, vy, pred_x, pred_y, arrival):
         markers = MarkerArray()
         stamp = rospy.Time.now()
 
@@ -264,6 +332,81 @@ class TrajectoryPredictor:
         pred_marker.color.a = 1.0
         pred_marker.lifetime = rospy.Duration(0.3)
         markers.markers.append(pred_marker)
+
+        # 4) Workspace boundary line (y=0.60)
+        boundary_marker = Marker()
+        boundary_marker.header.stamp = stamp
+        boundary_marker.header.frame_id = self.frame_id
+        boundary_marker.ns = "ball_trajectory"
+        boundary_marker.id = 3
+        boundary_marker.type = Marker.LINE_STRIP
+        boundary_marker.action = Marker.ADD
+        boundary_marker.pose.orientation.w = 1.0
+        boundary_marker.scale.x = 0.005  # line width
+        boundary_marker.color.r = 1.0
+        boundary_marker.color.g = 1.0
+        boundary_marker.color.b = 1.0
+        boundary_marker.color.a = 0.5
+        boundary_marker.lifetime = rospy.Duration(0.3)
+
+        # Draw line from min_x to max_x at workspace_y
+        p_min = Point()
+        p_min.x = self.workspace_min_x
+        p_min.y = self.workspace_y
+        p_min.z = self.marker_z
+        boundary_marker.points.append(p_min)
+
+        p_max = Point()
+        p_max.x = self.workspace_max_x
+        p_max.y = self.workspace_y
+        p_max.z = self.marker_z
+        boundary_marker.points.append(p_max)
+
+        markers.markers.append(boundary_marker)
+
+        # 5) Arrival point (if valid)
+        if arrival is not None:
+            arrival_marker = Marker()
+            arrival_marker.header.stamp = stamp
+            arrival_marker.header.frame_id = self.frame_id
+            arrival_marker.ns = "ball_trajectory"
+            arrival_marker.id = 4
+            arrival_marker.type = Marker.SPHERE
+            arrival_marker.action = Marker.ADD
+            arrival_marker.pose.position.x = arrival['x']
+            arrival_marker.pose.position.y = self.workspace_y
+            arrival_marker.pose.position.z = self.marker_z
+            arrival_marker.pose.orientation.w = 1.0
+            arrival_marker.scale.x = 0.05
+            arrival_marker.scale.y = 0.05
+            arrival_marker.scale.z = 0.05
+            arrival_marker.color.r = 1.0
+            arrival_marker.color.g = 0.0
+            arrival_marker.color.b = 1.0  # Magenta
+            arrival_marker.color.a = 1.0
+            arrival_marker.lifetime = rospy.Duration(0.3)
+            markers.markers.append(arrival_marker)
+
+            # Add text label with arrival time
+            text_marker = Marker()
+            text_marker.header.stamp = stamp
+            text_marker.header.frame_id = self.frame_id
+            text_marker.ns = "ball_trajectory"
+            text_marker.id = 5
+            text_marker.type = Marker.TEXT_VIEW_FACING
+            text_marker.action = Marker.ADD
+            text_marker.pose.position.x = arrival['x']
+            text_marker.pose.position.y = self.workspace_y
+            text_marker.pose.position.z = self.marker_z + 0.05
+            text_marker.pose.orientation.w = 1.0
+            text_marker.scale.z = 0.03
+            text_marker.color.r = 1.0
+            text_marker.color.g = 1.0
+            text_marker.color.b = 1.0
+            text_marker.color.a = 1.0
+            text_marker.text = f"t={arrival['time']:.2f}s"
+            text_marker.lifetime = rospy.Duration(0.3)
+            markers.markers.append(text_marker)
 
         self.marker_pub.publish(markers)
 
